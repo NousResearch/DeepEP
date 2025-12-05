@@ -102,7 +102,13 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_sms,
               int num_max_send_tokens,
-              int num_recv_buffer_tokens);
+              int num_recv_buffer_tokens,
+              // NEW: expert_weights for weighted dispatch (backward of weighted combine)
+              // When provided (not nullptr), each received token is multiplied by its weight:
+              // recv_x[i] = dispatched_x[i] * expert_weights[i]
+              // Shape: [num_recv_tokens] with dtype float32
+              // This is used in backward of FusedCombineWeighted: grad_x = dispatch(grad_y) * prob
+              const float* expert_weights = nullptr);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,

@@ -327,11 +327,23 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 # NEW: Per-token weights for weighted dispatch (backward of weighted combine)
+                 expert_weights: Optional[torch.Tensor] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
+
+        NEW: Weighted Dispatch (Backward of Weighted Combine)
+        -----------------------------------------------------
+        When expert_weights is provided, each received token is multiplied by its weight:
+            recv_x[i] = dispatched_x[i] * expert_weights[i]
+
+        This is the backward operation for weighted combine:
+            Forward (weighted combine): y = Σ(x_i * weight_i)
+            Backward: grad_x = dispatch(grad_y) * weight
+
         Intranode kernels require all the ranks should be visible via NVLink.
         Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
             index should be visible via RDMA.
@@ -357,6 +369,9 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            expert_weights: NEW - `[num_recv_tokens]` or `[num_recv_tokens, 1]` with `torch.float`, per-token weights
+                for weighted dispatch. When provided, each received token is multiplied by its weight during dispatch:
+                recv_x[i] = dispatched_x[i] * expert_weights[i]. This is used in backward of FusedCombineWeighted.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
@@ -373,7 +388,10 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
         # Internode
+        # NOTE: expert_weights not yet supported for internode dispatch
         if self.runtime.get_num_rdma_ranks() > 1:
+            if expert_weights is not None:
+                raise NotImplementedError("expert_weights not yet supported for internode dispatch")
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                            previous_event, async_finish, allocate_on_comm_stream)
@@ -384,17 +402,21 @@ class Buffer:
             assert topk_idx is None and topk_weights is None
             rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
             num_recv_tokens = recv_src_idx.size(0)
+            # NEW: Pass expert_weights for weighted dispatch (backward of weighted combine)
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                expert_weights)  # NEW: per-token weights for weighted dispatch
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
+            # NEW: Pass expert_weights for weighted dispatch (backward of weighted combine)
             recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config,
-                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                                                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                                                expert_weights)  # NEW: per-token weights for weighted dispatch
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (
                 recv_x, recv_x_scales

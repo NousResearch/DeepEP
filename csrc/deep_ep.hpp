@@ -157,6 +157,8 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+    // NEW: Added expert_weights parameter for weighted dispatch (backward of weighted combine)
+    // When expert_weights is provided, each received token is multiplied by its weight
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -183,7 +185,9 @@ public:
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
-                       bool allocate_on_comm_stream);
+                       bool allocate_on_comm_stream,
+                       // NEW: Per-token weights for weighted dispatch
+                       const std::optional<torch::Tensor>& expert_weights = std::nullopt);
 
     // NEW: Added expert_weights parameter for weighted combine (fused prob multiplication)
     // When expert_weights is provided, performs: y = Σ(x_i * weight_i) instead of y = Σ(x_i)

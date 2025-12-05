@@ -194,6 +194,20 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+// ====================================================================================
+// Dispatch kernel: Sends tokens to expert-owning ranks
+//
+// NEW FEATURE: Weighted Dispatch (Backward of Weighted Combine)
+// -------------------------------------------------------------
+// When expert_weights is provided (not nullptr), each received token is multiplied
+// by its weight: recv_x[i] = dispatched_x[i] * expert_weights[i]
+//
+// This is the backward operation for weighted combine:
+//   Forward (weighted combine): y = Σ(x_i * weight_i)
+//   Backward: grad_x = dispatch(grad_y) * weight
+//
+// The fused weighted dispatch saves one memory read/write operation.
+// ====================================================================================
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
@@ -219,7 +233,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            void** buffer_ptrs,
                                                            int rank,
                                                            int num_max_send_tokens,
-                                                           int num_recv_buffer_tokens) {
+                                                           int num_recv_buffer_tokens,
+                                                           // NEW: Per-token weights for weighted dispatch
+                                                           // Shape: [num_recv_tokens], dtype: float32
+                                                           // When nullptr, performs unweighted dispatch (original behavior)
+                                                           const float* expert_weights) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -479,6 +497,42 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #endif
             }
 
+            // ===========================================================================
+            // NEW: Apply expert_weights for weighted dispatch
+            // For each received token, multiply by its weight: recv_x[i] *= weight[i]
+            // This is the backward of weighted combine: grad_x = dispatch(grad_y) * prob
+            // ===========================================================================
+            if (expert_weights != nullptr) {
+                // Wait for all copies to complete before applying weights
+                asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+
+                // Apply weights to each token
+                for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
+                    int64_t recv_token_idx = total_offset + chunk_idx;
+                    float weight = __ldg(expert_weights + recv_token_idx);
+
+                    // Process hidden dimension in int4 chunks (each int4 = 8 bf16 values)
+                    auto recv_x_ptr = recv_x + recv_token_idx * hidden_int4;
+                    for (int i = lane_id; i < hidden_int4; i += 32) {
+                        // Load int4 (8 bf16 values)
+                        int4 data = ld_nc_global(recv_x_ptr + i);
+
+                        // Reinterpret as bf16 and apply weight
+                        auto* bf16_data = reinterpret_cast<__nv_bfloat16*>(&data);
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            float val = __bfloat162float(bf16_data[j]);
+                            val *= weight;
+                            bf16_data[j] = __float2bfloat16(val);
+                        }
+
+                        // Store weighted result
+                        st_na_global(recv_x_ptr + i, data);
+                    }
+                }
+                __syncwarp();
+            }
+
             // Copy `src_idx`
             #pragma unroll 4
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; chunk_idx < cached_channel_tail_idx;
@@ -558,7 +612,10 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_sms,
               int num_max_send_tokens,
-              int num_recv_buffer_tokens) {
+              int num_recv_buffer_tokens,
+              // NEW: Per-token weights for weighted dispatch (backward of weighted combine)
+              // When not nullptr, each received token is multiplied by its weight
+              const float* expert_weights) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
 #ifndef DISABLE_SM90_FEATURES
@@ -598,7 +655,8 @@ void dispatch(void* recv_x,
                       buffer_ptrs,                                       \
                       rank,                                              \
                       num_max_send_tokens,                               \
-                      num_recv_buffer_tokens);                           \
+                      num_recv_buffer_tokens,                            \
+                      expert_weights);  /* NEW: per-token weights for weighted dispatch */ \
     }                                                                    \
     break
 

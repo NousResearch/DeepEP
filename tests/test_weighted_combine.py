@@ -220,6 +220,9 @@ def test_weighted_combine_backward(
 
     Verifies that gradients are computed correctly using the chain rule:
         grad_x = dispatch(grad_y) * prob
+
+    This test also verifies that the NEW fused weighted dispatch (grad_x = dispatch(grad_y, expert_weights=prob))
+    produces the same result as the OLD approach (grad_x = dispatch(grad_y) * prob).
     """
     if local_rank == 0:
         print(f'\n[test_weighted_combine_backward] Testing backward pass')
@@ -273,11 +276,11 @@ def test_weighted_combine_backward(
     # Create grad_output for backward
     grad_output = torch.randn_like(combined)
 
-    # Backward
+    # Backward (this now uses fused weighted dispatch internally)
     combined.backward(grad_output)
     grad_x_fused = recv_x_grad.grad.clone()
 
-    # ===== Compute expected gradient manually =====
+    # ===== Compute expected gradient manually (OLD approach) =====
     # grad_x = dispatch(grad_y) * prob
     grad_x_dispatched, _, _, _, _, _ = buffer.dispatch(
         grad_output.contiguous(),
@@ -285,7 +288,7 @@ def test_weighted_combine_backward(
     )
     grad_x_expected = grad_x_dispatched * prob.unsqueeze(1)
 
-    # Compare gradients
+    # Compare fused vs unfused
     diff = calc_diff(grad_x_fused.float(), grad_x_expected.float())
     passed = diff < 1e-4
 
@@ -293,6 +296,197 @@ def test_weighted_combine_backward(
         print(f'  [backward correctness] Gradient difference: {diff:.2e} - {"PASSED" if passed else "FAILED"}')
 
     assert passed, f"Backward pass produces incorrect gradients! diff={diff}"
+
+    return True
+
+
+def test_weighted_dispatch_basic(
+    buffer: deep_ep.Buffer,
+    num_tokens: int,
+    hidden: int,
+    num_topk: int,
+    num_experts: int,
+    num_ranks: int,
+    rank: int,
+    local_rank: int
+):
+    """
+    Test weighted dispatch correctness.
+
+    Weighted dispatch: recv_x[i] = dispatched_x[i] * expert_weights[i]
+    This is the fused version of: recv_x = dispatch(x); recv_x = recv_x * weights
+
+    Verifies that:
+    1. Fused weighted dispatch matches unfused: dispatch(x, expert_weights=w) == dispatch(x) * w
+    2. This is correct for the backward pass of weighted combine
+    """
+    if local_rank == 0:
+        print(f'\n[test_weighted_dispatch_basic] Testing weighted dispatch correctness')
+
+    torch.manual_seed(rank + 111)
+
+    # Create test data
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+
+    rank_idx = topk_idx // (num_experts // num_ranks)
+    rank_idx = rank_idx.to(torch.int64)
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device='cuda')
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    for i in range(num_ranks):
+        num_tokens_per_rank[i] = (rank_idx == i).sum()
+        token_sel = (rank_idx == i).max(dim=-1)[0]
+        count = token_sel.sum().item()
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        tokens[:count] = torch.sort(tokens[:count])[0]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    is_token_in_rank = token_idx_in_rank >= 0
+
+    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device='cuda')
+    for i in range(num_experts):
+        num_tokens_per_expert[i] = (topk_idx == i).sum()
+
+    # First do a standard dispatch to get the handle (needed for cached dispatch)
+    recv_x_first, _, _, _, handle, _ = buffer.dispatch(
+        x=x,
+        num_tokens_per_rank=num_tokens_per_rank,
+        is_token_in_rank=is_token_in_rank,
+        num_tokens_per_expert=num_tokens_per_expert,
+    )
+    num_recv_tokens = recv_x_first.size(0)
+
+    # Create expert_weights for the received tokens
+    expert_weights = torch.rand((num_recv_tokens,), dtype=torch.float32, device='cuda') * 0.8 + 0.1
+
+    # ===== Test 1: Unfused approach (reference) =====
+    # First dispatch x, then multiply by weights
+    recv_x_unfused, _, _, _, _, _ = buffer.dispatch(
+        x=x.clone(),
+        handle=handle,
+    )
+    recv_x_unfused_weighted = (recv_x_unfused.float() * expert_weights.unsqueeze(1)).to(recv_x_unfused.dtype)
+
+    # ===== Test 2: Fused approach (new weighted dispatch) =====
+    recv_x_fused, _, _, _, _, _ = buffer.dispatch(
+        x=x.clone(),
+        handle=handle,
+        expert_weights=expert_weights,  # NEW: Fused multiplication in kernel
+    )
+
+    # ===== Verify correctness =====
+    diff = calc_diff(recv_x_fused, recv_x_unfused_weighted)
+    passed = diff < 1e-4
+
+    if local_rank == 0:
+        print(f'  [unfused vs fused dispatch] Difference: {diff:.2e} - {"PASSED" if passed else "FAILED"}')
+
+    assert passed, f"Weighted dispatch results don't match unfused approach! diff={diff}"
+
+    return True
+
+
+def test_weighted_dispatch_backward_correctness(
+    buffer: deep_ep.Buffer,
+    num_tokens: int,
+    hidden: int,
+    num_topk: int,
+    num_experts: int,
+    num_ranks: int,
+    rank: int,
+    local_rank: int
+):
+    """
+    Test that weighted dispatch correctly implements the backward of weighted combine.
+
+    The math:
+        Forward (weighted combine):   y = Σ(x_i * prob_i)
+        Backward (weighted dispatch): grad_x = dispatch(grad_y) * prob
+
+    This verifies the entire gradient flow is correct for a simple computation:
+        loss = combined.sum()
+        loss.backward()
+    """
+    if local_rank == 0:
+        print(f'\n[test_weighted_dispatch_backward_correctness] Testing full gradient flow')
+
+    torch.manual_seed(rank + 222)
+
+    # Create test data
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+
+    rank_idx = topk_idx // (num_experts // num_ranks)
+    rank_idx = rank_idx.to(torch.int64)
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device='cuda')
+    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    for i in range(num_ranks):
+        num_tokens_per_rank[i] = (rank_idx == i).sum()
+        token_sel = (rank_idx == i).max(dim=-1)[0]
+        count = token_sel.sum().item()
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        tokens[:count] = torch.sort(tokens[:count])[0]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    is_token_in_rank = token_idx_in_rank >= 0
+
+    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device='cuda')
+    for i in range(num_experts):
+        num_tokens_per_expert[i] = (topk_idx == i).sum()
+
+    # Dispatch tokens
+    recv_x, _, _, _, handle, _ = buffer.dispatch(
+        x=x,
+        num_tokens_per_rank=num_tokens_per_rank,
+        is_token_in_rank=is_token_in_rank,
+        num_tokens_per_expert=num_tokens_per_expert,
+    )
+    num_recv_tokens = recv_x.size(0)
+    prob = torch.rand((num_recv_tokens,), dtype=torch.float32, device='cuda') * 0.5 + 0.1
+
+    # ===== Test 1: Compute gradient using fused_combine_weighted (uses fused weighted dispatch in backward) =====
+    recv_x_v1 = recv_x.clone().float().requires_grad_(True)
+    combined_v1 = deep_ep.fused_combine_weighted(recv_x_v1.to(recv_x.dtype), prob, buffer, handle)
+    loss_v1 = combined_v1.sum()
+    loss_v1.backward()
+    grad_v1 = recv_x_v1.grad.clone()
+
+    # ===== Test 2: Compute gradient using manual unfused approach (reference) =====
+    recv_x_v2 = recv_x.clone().float().requires_grad_(True)
+    # Manual forward: scaled = x * prob; combined = combine(scaled)
+    scaled = (recv_x_v2 * prob.unsqueeze(1)).to(recv_x.dtype)
+    combined_v2, _, _ = buffer.combine(scaled, handle=handle)
+    loss_v2 = combined_v2.sum()
+    loss_v2.backward()
+    grad_v2 = recv_x_v2.grad.clone()
+
+    # ===== Compare =====
+    # Forward outputs should match
+    diff_fwd = calc_diff(combined_v1.float(), combined_v2.float())
+    passed_fwd = diff_fwd < 1e-4
+
+    if local_rank == 0:
+        print(f'  [forward output] Difference: {diff_fwd:.2e} - {"PASSED" if passed_fwd else "FAILED"}')
+
+    # Backward gradients should match
+    diff_bwd = calc_diff(grad_v1, grad_v2)
+    passed_bwd = diff_bwd < 1e-4
+
+    if local_rank == 0:
+        print(f'  [backward gradient] Difference: {diff_bwd:.2e} - {"PASSED" if passed_bwd else "FAILED"}')
+
+    assert passed_fwd, f"Forward outputs don't match! diff={diff_fwd}"
+    assert passed_bwd, f"Backward gradients don't match! diff={diff_bwd}"
 
     return True
 
@@ -467,7 +661,7 @@ def test_weighted_combine_performance(
 
 def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks: int, rank: int,
               buffer: deep_ep.Buffer, group: dist.ProcessGroup):
-    """Run all weighted combine tests."""
+    """Run all weighted combine and weighted dispatch tests."""
     num_tokens = args.num_tokens
     hidden = args.hidden
     num_topk = args.num_topk
@@ -475,10 +669,11 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
 
     if local_rank == 0:
         print('=' * 60)
-        print('Testing Weighted Combine (Fused Prob Multiplication)')
+        print('Testing Weighted Combine & Weighted Dispatch')
+        print('(Fused Prob Multiplication in Combine & Dispatch Kernels)')
         print('=' * 60)
 
-    # Run all tests
+    # ===== Weighted Combine Tests =====
     test_weighted_combine_basic(buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, local_rank)
     group.barrier()
 
@@ -491,12 +686,20 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     test_weighted_combine_edge_cases(buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, local_rank)
     group.barrier()
 
+    # ===== Weighted Dispatch Tests (NEW) =====
+    test_weighted_dispatch_basic(buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, local_rank)
+    group.barrier()
+
+    test_weighted_dispatch_backward_correctness(buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, local_rank)
+    group.barrier()
+
+    # ===== Performance Benchmark =====
     test_weighted_combine_performance(buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, local_rank)
     group.barrier()
 
     if local_rank == 0:
         print('\n' + '=' * 60)
-        print('All weighted combine tests PASSED!')
+        print('All weighted combine & dispatch tests PASSED!')
         print('=' * 60)
 
 

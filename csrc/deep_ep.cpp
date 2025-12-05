@@ -467,6 +467,18 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
            std::optional<EventHandle>>
+// ====================================================================================
+// intranode_dispatch: Dispatches tokens to expert-owning ranks
+//
+// NEW FEATURE: Weighted Dispatch (Backward of Weighted Combine)
+// -------------------------------------------------------------
+// When expert_weights is provided, each received token is multiplied by its weight:
+//   recv_x[i] = dispatched_x[i] * expert_weights[i]
+//
+// This is the backward operation for weighted combine:
+//   Forward (weighted combine): y = Σ(x_i * weight_i)
+//   Backward: grad_x = dispatch(grad_y) * weight
+// ====================================================================================
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx,
@@ -482,7 +494,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
-                           bool allocate_on_comm_stream) {
+                           bool allocate_on_comm_stream,
+                           // NEW: Per-token weights for weighted dispatch
+                           const std::optional<torch::Tensor>& expert_weights) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -556,6 +570,18 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
         scale_token_stride = static_cast<int>(x_scales->stride(0));
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
+    }
+
+    // NEW: Expert weights checks for weighted dispatch (backward of weighted combine)
+    // Note: Full shape validation deferred until we know num_recv_tokens
+    float* expert_weights_ptr = nullptr;
+    if (expert_weights.has_value()) {
+        auto ew = expert_weights.value();
+        EP_HOST_ASSERT(ew.is_contiguous());
+        EP_HOST_ASSERT(ew.scalar_type() == torch::kFloat32);
+        // Shape validation: [num_recv_tokens] or [num_recv_tokens, 1]
+        // Actual num_recv_tokens check done later
+        expert_weights_ptr = ew.data_ptr<float>();
     }
 
     // Allocate all tensors on comm stream if set
@@ -715,7 +741,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         comm_stream,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
-                        config.num_max_nvl_chunked_recv_tokens);
+                        config.num_max_nvl_chunked_recv_tokens,
+                        expert_weights_ptr);  // NEW: Per-token weights for weighted dispatch
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -742,7 +769,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                          cached_rank_prefix_matrix,
                          recv_topk_idx,
                          recv_topk_weights,
-                         recv_x_scales}) {
+                         recv_x_scales,
+                         expert_weights}) {  // NEW: Include expert_weights
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();

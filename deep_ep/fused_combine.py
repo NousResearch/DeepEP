@@ -111,7 +111,7 @@ class FusedCombineWeighted(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         """
-        Backward: dispatch grad_y, then scale by prob.
+        Backward: weighted dispatch - fuses dispatch(grad_y) * prob into single kernel.
 
         Math:
             Forward:  y = Σ(x_i * prob_i)
@@ -119,8 +119,11 @@ class FusedCombineWeighted(torch.autograd.Function):
                      grad_x_i = grad_y * prob_i
 
         Implementation:
-            1. Dispatch sends grad_y back to expert-owning ranks
-            2. Scale by prob (chain rule): grad_x = dispatch(grad_y) * prob
+            NEW: Uses weighted dispatch to fuse the multiplication into the kernel:
+                grad_x = dispatch(grad_y, expert_weights=prob)
+            This is equivalent to the OLD two-step process:
+                grad_x = dispatch(grad_y) * prob
+            But more efficient as it saves one memory read/write.
 
         Note:
             We don't compute grad_prob because prob comes from the router
@@ -130,19 +133,30 @@ class FusedCombineWeighted(torch.autograd.Function):
         handle = ctx.handle
         buffer = ctx.buffer
 
-        # Dispatch sends grad_y back to expert-owning ranks
-        # This is the reverse of combine (combine's backward IS dispatch)
+        # Ensure prob is float32 as required by DeepEP
+        if prob.dtype != torch.float32:
+            prob = prob.float()
+
+        # Flatten prob if it's 2D with shape [N, 1]
+        if prob.dim() == 2 and prob.size(1) == 1:
+            prob = prob.squeeze(1)
+
+        # NEW: Fused weighted dispatch - combines dispatch and multiply in one kernel
+        # This is the reverse of weighted combine:
+        #   Forward (weighted combine):   y = Σ(x_i * prob_i)
+        #   Backward (weighted dispatch): grad_x = dispatch(grad_y) * prob
+        # The multiplication is fused into the dispatch kernel for efficiency
         grad_x, _, _, _, _, _ = buffer.dispatch(
             grad_output.contiguous(),
             handle=handle,
+            expert_weights=prob,  # NEW: Fused multiplication in dispatch kernel!
         )
 
-        # Scale by prob (chain rule)
-        # grad_x shape: [num_local_tokens, dim]
-        # prob shape: [num_local_tokens] or [num_local_tokens, 1]
-        if prob.dim() == 1:
-            prob = prob.unsqueeze(1)  # [N] -> [N, 1] for broadcasting
-        grad_x = grad_x * prob
+        # OLD (kept as comment for reference):
+        # grad_x, _, _, _, _, _ = buffer.dispatch(grad_output.contiguous(), handle=handle)
+        # if prob.dim() == 1:
+        #     prob = prob.unsqueeze(1)  # [N] -> [N, 1] for broadcasting
+        # grad_x = grad_x * prob
 
         # Return gradients for all forward arguments
         # (x, prob, buffer, handle, async_finish, allocate_on_comm_stream)
