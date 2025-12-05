@@ -769,6 +769,18 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             event};
 }
 
+// ====================================================================================
+// intranode_combine: Combines expert outputs from all ranks back to original tokens
+//
+// NEW FEATURE: Weighted Combine (Fused Prob Multiplication)
+// ---------------------------------------------------------
+// When expert_weights is provided, performs: y = Σ(x_i * weight_i)
+// This fuses the probability multiplication into the combine operation.
+//
+// Usage in MoE forward:
+//   BEFORE: expert_out = h @ w2; scaled = expert_out * prob; combined = combine(scaled)
+//   AFTER:  expert_out = h @ w2; combined = combine(expert_out, expert_weights=prob)
+// ====================================================================================
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::intranode_combine(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& topk_weights,
@@ -781,7 +793,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const Config& config,
     std::optional<EventHandle>& previous_event,
     bool async,
-    bool allocate_on_comm_stream) {
+    bool allocate_on_comm_stream,
+    // NEW: Per-token weights for weighted combine (fused prob multiplication)
+    // Shape: [num_tokens] or [num_tokens, 1], dtype: float32
+    // When nullopt, performs unweighted sum (original behavior)
+    const std::optional<torch::Tensor>& expert_weights) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
@@ -831,6 +847,24 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
 
+    // NEW: Validate expert_weights for weighted combine
+    // expert_weights shape: [num_tokens] or [num_tokens, 1], dtype: float32
+    float* expert_weights_ptr = nullptr;
+    if (expert_weights.has_value()) {
+        auto ew = expert_weights.value();
+        EP_HOST_ASSERT(ew.is_contiguous());
+        EP_HOST_ASSERT(ew.scalar_type() == torch::kFloat32);
+        // Support both [num_tokens] and [num_tokens, 1] shapes
+        if (ew.dim() == 1) {
+            EP_HOST_ASSERT(ew.size(0) == num_tokens);
+        } else if (ew.dim() == 2) {
+            EP_HOST_ASSERT(ew.size(0) == num_tokens && ew.size(1) == 1);
+        } else {
+            EP_HOST_ASSERT(false && "expert_weights must be 1D or 2D tensor");
+        }
+        expert_weights_ptr = ew.data_ptr<float>();
+    }
+
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
     intranode::cached_notify_combine(buffer_ptrs_gpu,
@@ -857,10 +891,17 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    // Buffer size validation:
+    // - Queue head and tail: num_channels * num_ranks * sizeof(int) * 2
+    // - Data buffer: num_channels * num_ranks * num_recv_buffer_tokens * hidden * element_size
+    // - Source index buffer: num_channels * num_ranks * num_recv_buffer_tokens * sizeof(int)
+    // - Top-k weight buffer: num_channels * num_ranks * num_recv_buffer_tokens * num_topk * sizeof(float)
+    // - NEW: Expert weight buffer: num_channels * num_ranks * num_recv_buffer_tokens * sizeof(float)
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
-                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) + // Top-k weight buffer
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float)  // NEW: Expert weight buffer
                    <= num_nvl_bytes);
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
@@ -883,7 +924,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        comm_stream,
                        config.num_sms,
                        config.num_max_nvl_chunked_send_tokens,
-                       config.num_max_nvl_chunked_recv_tokens);
+                       config.num_max_nvl_chunked_recv_tokens,
+                       expert_weights_ptr);  // NEW: Per-token weights for weighted combine
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -894,7 +936,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1, expert_weights}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();

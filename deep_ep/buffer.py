@@ -407,11 +407,22 @@ class Buffer:
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 config: Optional[Config] = None,
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                allocate_on_comm_stream: bool = False) -> \
+                allocate_on_comm_stream: bool = False,
+                # NEW: Per-token weights for weighted combine (fused prob multiplication)
+                expert_weights: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
-        Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
-            settings are supported.
+        Combine (reduce) tokens from different ranks, both intranode and internode settings are supported.
+
+        NEW: Weighted Combine (Fused Prob Multiplication)
+        -------------------------------------------------
+        When expert_weights is provided, performs: y = Σ(x_i * weight_i) instead of y = Σ(x_i)
+        This fuses the probability multiplication into the combine operation.
+
+        Usage in MoE forward:
+            BEFORE: expert_out = h @ w2; scaled = expert_out * prob; combined = combine(scaled)
+            AFTER:  expert_out = h @ w2; combined = combine(expert_out, expert_weights=prob)
+
         Intranode kernels require all the ranks should be visible via NVLink.
         Internode kernels require the ranks in a node should be visible via NVLink, while the ranks with the same GPU
             index should be visible via RDMA.
@@ -425,6 +436,9 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            expert_weights: NEW - `[num_tokens]` or `[num_tokens, 1]` with `torch.float`, per-token weights for
+                weighted combine. When provided, each token's contribution is multiplied by its weight during
+                the reduction: y = Σ(x_i * weight_i). This fuses the probability multiplication into combine.
 
         Returns:
             recv_x: the reduced token from its dispatched ranks.
@@ -435,7 +449,10 @@ class Buffer:
         config = self.get_combine_config(self.group_size) if config is None else config
 
         # Internode
+        # NOTE: expert_weights not yet supported for internode combine
         if self.runtime.get_num_rdma_ranks() > 1:
+            if expert_weights is not None:
+                raise NotImplementedError("expert_weights not yet supported for internode combine")
             return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
@@ -443,10 +460,12 @@ class Buffer:
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix,
-                                                                          channel_prefix_matrix, send_head, config,
-                                                                          getattr(previous_event, 'event',
-                                                                                  None), async_finish, allocate_on_comm_stream)
+        # NEW: Pass expert_weights for weighted combine (fused prob multiplication)
+        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
+            x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix,
+            channel_prefix_matrix, send_head, config,
+            getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+            expert_weights)  # NEW: per-token weights for weighted combine
         return recv_x, recv_topk_weights, EventOverlap(event)
 
     # noinspection PyTypeChecker

@@ -135,7 +135,12 @@ void combine(cudaDataType_t type,
              cudaStream_t stream,
              int num_sms,
              int num_max_send_tokens,
-             int num_recv_buffer_tokens);
+             int num_recv_buffer_tokens,
+             // NEW: expert_weights for weighted combine (fused prob multiplication)
+             // When provided (not nullptr), each token's contribution is multiplied by its weight
+             // during the sum: y = Σ(x_i * weight_i) instead of y = Σ(x_i)
+             // Shape: [num_tokens] with dtype float32
+             const float* expert_weights = nullptr);
 
 }  // namespace intranode
 

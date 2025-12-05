@@ -688,6 +688,23 @@ void cached_notify_combine(void** buffer_ptrs,
 #undef CACHED_NOTIFY_COMBINE
 }
 
+// ====================================================================================
+// Combine kernel: Reduces expert outputs from all ranks back to original tokens
+//
+// NEW FEATURE: Weighted Combine (Fused Prob Multiplication)
+// ---------------------------------------------------------
+// When expert_weights is provided (not nullptr), the kernel performs:
+//   y = Σ(x_i * weight_i)  instead of  y = Σ(x_i)
+//
+// This fuses the probability multiplication into the combine operation:
+//   BEFORE: expert_out = h @ w2; scaled = expert_out * prob; combined = combine(scaled)
+//   AFTER:  expert_out = h @ w2; combined = weighted_combine(expert_out, prob)
+//
+// Backward correctness:
+//   Forward:  y = Σ(expert_out_i * prob_i)
+//   Backward: dy/d(expert_out_i) = prob_i
+//   So grad_expert_out = dispatch(grad_y) * prob (done in Python after dispatch)
+// ====================================================================================
 template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                                                           float* recv_topk_weights,
@@ -706,7 +723,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                                                           void** buffer_ptrs,
                                                           int rank,
                                                           int num_max_send_tokens,
-                                                          int num_recv_buffer_tokens) {
+                                                          int num_recv_buffer_tokens,
+                                                          // NEW: Per-token weights for weighted combine
+                                                          // Shape: [num_tokens], dtype: float32
+                                                          // When nullptr, performs unweighted sum (original behavior)
+                                                          const float* expert_weights) {
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
@@ -752,6 +773,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
         // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
         // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
+        // NEW: `expert_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(float)
+        //      Per-token weights for weighted combine (one weight per token)
         auto channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
         auto channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset);
         auto channel_x_buffers = Buffer<int4>(
@@ -760,6 +783,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
         auto channel_topk_weights_buffers = Buffer<float>(
             ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+        // NEW: Buffer for expert weights (one float per token for weighted combine)
+        auto channel_expert_weights_buffers = Buffer<float>(
+            ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
 
         // Get tasks
         // NOTES: `channel_offset` is already shifted
@@ -813,6 +839,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 if (num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
                         __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+
+                // NEW: Send expert_weights for weighted combine
+                // Each token has one weight that will be used to scale its contribution during reduction
+                if (expert_weights != nullptr and elect_one_sync())
+                    channel_expert_weights_buffers[dst_slot_idx] = __ldg(expert_weights + token_idx + i);
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
@@ -875,6 +906,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // All lanes will use data buffer, but only rank lane will use `head/tail/src_idx`
             Buffer<int4> channel_x_buffers[kNumRanks];
             Buffer<float> channel_topk_weights_buffers[kNumRanks];
+            // NEW: Per-token expert weights for weighted combine
+            Buffer<float> channel_expert_weights_buffers[kNumRanks];
 
             // Calculate pointers by the specific layout
             #pragma unroll
@@ -895,6 +928,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
                 channel_topk_weights_buffers[i] = Buffer<float>(
                     ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+
+                // NEW: `expert_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(float)
+                // Per-token weights for weighted combine
+                channel_expert_weights_buffers[i] = Buffer<float>(
+                    ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
             }
 
             // The same tokens as the dispatch process
@@ -964,13 +1002,26 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     for (int j = 0; j < kDtypePerInt4; ++j)
                         values[j] = static_cast<float>(bias_0_values[j]) + static_cast<float>(bias_1_values[j]);
 
+                    // ===========================================================================
                     // Reduce all-to-all results
+                    // NEW: When expert_weights is provided, multiply each contribution by its weight
+                    //      y = Σ(x_i * weight_i) instead of y = Σ(x_i)
+                    // ===========================================================================
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j) {
+                        // NEW: Load expert weight for this contribution (if provided)
+                        // expert_weights is stored per token in the buffer
+                        float weight = 1.0f;
+                        if (expert_weights != nullptr) {
+                            weight = ld_nc_global(channel_expert_weights_buffers[topk_ranks[j]].buffer() + slot_indices[j]);
+                        }
+
                         auto recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value_int4[j]);
                         #pragma unroll
                         for (int k = 0; k < kDtypePerInt4; ++k)
-                            values[k] += static_cast<float>(recv_value_dtypes[k]);
+                            // OLD: values[k] += static_cast<float>(recv_value_dtypes[k]);
+                            // NEW: Multiply by weight during accumulation for fused prob multiplication
+                            values[k] += static_cast<float>(recv_value_dtypes[k]) * weight;
                     }
 
                     // Cast back to `dtype_t`
@@ -1052,7 +1103,10 @@ void combine(cudaDataType_t type,
              cudaStream_t stream,
              int num_sms,
              int num_max_send_tokens,
-             int num_recv_buffer_tokens) {
+             int num_recv_buffer_tokens,
+             // NEW: Per-token weights for weighted combine (fused prob multiplication)
+             // When nullptr, performs unweighted sum (original behavior)
+             const float* expert_weights) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 4096;
 #ifndef DISABLE_SM90_FEATURES
@@ -1082,7 +1136,8 @@ void combine(cudaDataType_t type,
                       buffer_ptrs,                                             \
                       rank,                                                    \
                       num_max_send_tokens,                                     \
-                      num_recv_buffer_tokens);                                 \
+                      num_recv_buffer_tokens,                                  \
+                      expert_weights);  /* NEW: per-token weights for weighted combine */ \
     }                                                                          \
     break
 #define COMBINE_DTYPE_LAUNCH_CASE(dtype)                 \

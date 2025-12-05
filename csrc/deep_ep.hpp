@@ -185,6 +185,8 @@ public:
                        bool async,
                        bool allocate_on_comm_stream);
 
+    // NEW: Added expert_weights parameter for weighted combine (fused prob multiplication)
+    // When expert_weights is provided, performs: y = Σ(x_i * weight_i) instead of y = Σ(x_i)
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
@@ -197,7 +199,9 @@ public:
         const Config& config,
         std::optional<EventHandle>& previous_event,
         bool async,
-        bool allocate_on_comm_stream);
+        bool allocate_on_comm_stream,
+        // NEW: Per-token weights for weighted combine
+        const std::optional<torch::Tensor>& expert_weights = std::nullopt);
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
